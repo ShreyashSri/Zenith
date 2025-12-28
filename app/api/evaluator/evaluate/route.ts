@@ -11,16 +11,13 @@ function createSuccessResponse(message: string, data: any, status = 200) {
     success: true,
     message,
     data,
-    timestamp: new Date().toISOString(),
   }, { status });
 }
 
 function createErrorResponse(message: string, code: string, status: number) {
   return NextResponse.json({
     success: false,
-    message,
     error: { code, message },
-    timestamp: new Date().toISOString(),
   }, { status });
 }
 
@@ -43,24 +40,21 @@ export async function PUT(request: NextRequest) {
     const body = await request.json();
     const { teamCode, scores, comments } = body;
 
-    // Validation
-    if (!teamCode) {
-      return createErrorResponse("Team code is required", "VALIDATION_ERROR", 400);
+    if (!teamCode || !scores || !comments) {
+      return createErrorResponse("Missing required fields", "VALIDATION_ERROR", 400);
     }
 
-    if (!scores || typeof scores !== 'object') {
-      return createErrorResponse("Scores object is required", "VALIDATION_ERROR", 400);
-    }
-
+    // Validate scores
     const { tech, ux, presentation } = scores;
-    
-    if (tech === undefined || ux === undefined || presentation === undefined) {
-      return createErrorResponse("All score fields (tech, ux, presentation) are required", "VALIDATION_ERROR", 400);
+    if (
+      typeof tech !== 'number' || tech < 0 || tech > 100 ||
+      typeof ux !== 'number' || ux < 0 || ux > 100 ||
+      typeof presentation !== 'number' || presentation < 0 || presentation > 100
+    ) {
+      return createErrorResponse("Invalid scores. Must be between 0 and 100", "VALIDATION_ERROR", 400);
     }
 
-    // Validate scores are 0-100
-    if (tech < 0 || tech > 100 || ux < 0 || ux > 100 || presentation < 0 || presentation > 100) {
-      return createErrorResponse("Scores must be between 0 and 100", "INVALID_SCORES", 400);
+    if (comments.length < 10) {
     }
 
     await dbConnect();
@@ -68,62 +62,74 @@ export async function PUT(request: NextRequest) {
     // Verify evaluator is assigned to this team
     const evaluator = await Evaluator.findOne({ uid: authResult.user.uid });
     if (!evaluator) {
-      return createErrorResponse("Evaluator not found", "NOT_FOUND", 404);
+      return createErrorResponse("Evaluator not found", "EVALUATOR_NOT_FOUND", 404);
     }
 
-    const assignmentIndex = evaluator.assignedTeams.findIndex(
+    const assignedTeamIndex = evaluator.assignedTeams.findIndex(
       (t: any) => t.teamCode === teamCode
     );
-    if (assignmentIndex === -1) {
-      return createErrorResponse("You are not assigned to this team", "NOT_ASSIGNED", 403);
+
+    if (assignedTeamIndex === -1) {
+      return createErrorResponse("This team is not assigned to you", "TEAM_NOT_ASSIGNED", 403);
     }
 
     const team = await Team.findOne({ teamCode });
     if (!team) {
-      return createErrorResponse("Team not found", "NOT_FOUND", 404);
+      return createErrorResponse("Team not found", "TEAM_NOT_FOUND", 404);
+    }
+
+    if (team.isEvaluated) {
+      return createErrorResponse("This team has already been evaluated", "ALREADY_EVALUATED", 409);
     }
 
     // Calculate total score
-    const total = tech + ux + presentation;
+    const totalScore = tech + ux + presentation;
 
-    // Update team with scores
-    await Team.findOneAndUpdate(
-      { teamCode },
-      {
-        isEvaluated: true,
-        scores: { tech, ux, presentation, total },
-        comments: comments || '',
-        evaluatedAt: new Date(),
-      }
-    );
+    team.isEvaluated = true;
+    team.scores = { tech, ux, presentation, total: totalScore };
+    team.comments = comments;
+    team.evaluator = evaluator.uid; // Store evaluator UID
+    team.evaluatedAt = new Date();
+    await team.save();
 
-    // Update evaluator assignment
-    evaluator.assignedTeams[assignmentIndex].isEvaluated = true;
+    evaluator.assignedTeams[assignedTeamIndex].isEvaluated = true;
+
     evaluator.lastEvaluationAt = new Date();
-    
-    // Update stats
-    if (evaluator.stats) {
-      const allScores = await Team.find({
-        teamCode: { $in: evaluator.assignedTeams.map((t: any) => t.teamCode) },
-        isEvaluated: true,
-      }).select('scores.total');
-      
-      const scoreValues = allScores.map(t => t.scores?.total || 0);
-      evaluator.stats.averageScore = scoreValues.length > 0
-        ? scoreValues.reduce((a, b) => a + b, 0) / scoreValues.length
-        : 0;
+
+    const evaluatedTeamCodes = evaluator.assignedTeams
+      .filter((t: any) => t.isEvaluated)
+      .map((t: any) => t.teamCode);
+
+    const allEvaluatedTeams = await Team.find({
+      teamCode: { $in: evaluatedTeamCodes },
+      isEvaluated: true
+    }).select('scores.total');
+
+    const totalScoreSum = allEvaluatedTeams.reduce((sum, t) => sum + (t.scores?.total || 0), 0);
+    const newAverage = allEvaluatedTeams.length > 0 ? totalScoreSum / allEvaluatedTeams.length : 0;
+
+    if (!evaluator.stats) {
+      evaluator.stats = {
+        averageScore: 0,
+        evaluationsCompleted: 0,
+        evaluationsPending: 0
+      };
     }
+    evaluator.stats.averageScore = parseFloat(newAverage.toFixed(2));
 
     await evaluator.save();
 
     return createSuccessResponse("Evaluation submitted successfully", {
-      teamCode,
-      scores: { tech, ux, presentation, total },
-      evaluatedAt: new Date().toISOString(),
-      evaluatorStats: {
-        evaluated: evaluator.evaluatedCount,
-        pending: evaluator.assignedCount - evaluator.evaluatedCount,
-      },
+      teamCode: team.teamCode,
+      teamName: team.teamName,
+      scores: { ...scores, total: totalScore },
+      comments: team.comments,
+      isEvaluated: true,
+      evaluatedAt: team.evaluatedAt,
+      evaluatedBy: {
+        id: evaluator.uid,
+        name: evaluator.name
+      }
     });
   } catch (error: any) {
     console.error("Submit evaluation error:", error);

@@ -8,21 +8,17 @@ import ProblemStatement from "@/models/ProblemStatement";
 
 export const dynamic = 'force-dynamic';
 
-function createSuccessResponse(message: string, data: any, status = 200) {
+function createSuccessResponse(data: any, status = 200) {
   return NextResponse.json({
     success: true,
-    message,
     data,
-    timestamp: new Date().toISOString(),
   }, { status });
 }
 
 function createErrorResponse(message: string, code: string, status: number) {
   return NextResponse.json({
     success: false,
-    message,
     error: { code, message },
-    timestamp: new Date().toISOString(),
   }, { status });
 }
 
@@ -32,9 +28,11 @@ function createErrorResponse(message: string, code: string, status: number) {
  */
 export async function GET(
   request: NextRequest,
-  { params }: { params: { teamCode: string } }
+  { params }: { params: Promise<{ teamCode: string }> }
 ) {
   try {
+    const { teamCode } = await params;
+
     const authResult = await authenticateUser(request);
     if (!authResult.success) {
       return createAuthErrorResponse(authResult);
@@ -50,65 +48,103 @@ export async function GET(
     // Verify evaluator is assigned to this team
     const evaluator = await Evaluator.findOne({ uid: authResult.user.uid });
     if (!evaluator) {
-      return createErrorResponse("Evaluator not found", "NOT_FOUND", 404);
+      return createErrorResponse("Evaluator profile not found", "EVALUATOR_NOT_FOUND", 404);
     }
 
-    const assignment = evaluator.assignedTeams.find(
-      (t: any) => t.teamCode === params.teamCode
+    const isAssigned = evaluator.assignedTeams.some(
+      (t: any) => t.teamCode === teamCode
     );
-    if (!assignment) {
-      return createErrorResponse("You are not assigned to this team", "NOT_ASSIGNED", 403);
+
+    if (!isAssigned) {
+      return createErrorResponse("This team is not assigned to you", "TEAM_NOT_ASSIGNED", 403);
     }
 
-    const team = await Team.findOne({ teamCode: params.teamCode });
+    // Fetch Team Details
+    const team = await Team.findOne({ teamCode });
     if (!team) {
-      return createErrorResponse("Team not found", "NOT_FOUND", 404);
+      return createErrorResponse("Team not found", "TEAM_NOT_FOUND", 404);
     }
 
-    // Get member details
-    const memberUids = team.teamMembers.map((m: any) => m.uid);
-    const members = await User.find({ uid: { $in: memberUids } })
-      .select('uid name email organisation github_link linkedin_link resume_link');
+    // Fetch Member Details
+    const memberUids = team.teamMembers.map(m => m.uid);
+    const members = await User.find({ uid: { $in: memberUids } });
+    const memberMap = new Map(members.map(u => [u.uid, u]));
 
-    // Get problem statement
+    // Fetch Problem Statement Details
     let problemStatement = null;
     if (team.appliedFor) {
-      const ps = await ProblemStatement.findById(team.appliedFor);
-      if (ps) {
-        problemStatement = { id: ps._id.toString(), title: ps.title, description: ps.description };
-      }
+      problemStatement = await ProblemStatement.findById(team.appliedFor);
     }
 
-    const formattedMembers = team.teamMembers.map((member: any) => {
-      const userInfo = members.find(u => u.uid === member.uid);
-      return {
-        uid: member.uid,
-        name: userInfo?.name || 'Unknown',
-        email: userInfo?.email || null,
-        organisation: userInfo?.organisation || null,
-        github_link: userInfo?.github_link || null,
-        linkedin_link: userInfo?.linkedin_link || null,
-        resume_link: userInfo?.resume_link || null,
-        role: member.role,
-      };
-    });
+    const formattedMembers = team.teamMembers.map(m => {
+      const user = memberMap.get(m.uid);
+      if (!user) return null;
 
-    return createSuccessResponse("Team details retrieved successfully", {
+      return {
+        id: user.uid,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        organisation: user.organisation,
+        age: user.age,
+        bio: user.bio,
+        role: m.role,
+        resume_link: user.resume_link,
+        profile_picture: user.profile_picture,
+        leetcode_profile: user.leetcode_profile,
+        github_link: user.github_link,
+        linkedin_link: user.linkedin_link,
+        codeforces_link: user.codeforces_link,
+        kaggle_link: user.kaggle_link,
+        devfolio_link: user.devfolio_link,
+        portfolio_link: user.portfolio_link,
+        ctf_profile: user.ctf_profile,
+        joinedAt: m.joinedAt
+      };
+    }).filter(Boolean);
+
+    const activeProblemStatement = problemStatement ? {
+      id: problemStatement._id.toString(),
+      title: problemStatement.title,
+      description: problemStatement.description
+    } : null;
+
+    const responseData = {
       teamCode: team.teamCode,
       teamName: team.teamName,
       teamMembers: formattedMembers,
       memberCount: team.memberCount,
-      appliedFor: problemStatement,
-      videoURL: team.videoURL || null,
-      submissionPDF: team.submissionPDF || null,
-      anyOtherLink: team.anyOtherLink || null,
+      appliedFor: activeProblemStatement,
+      videoURL: team.videoURL,
+      submissionPDF: team.submissionPDF,
+      anyOtherLink: team.anyOtherLink,
       isEvaluated: team.isEvaluated,
       scores: team.scores || null,
       comments: team.comments || null,
-      submittedAt: team.submittedAt || null,
-    });
+      submittedAt: team.submittedAt,
+      evaluationCriteria: {
+        tech: {
+          label: "Technical Implementation",
+          maxScore: 100,
+          description: "Code quality, architecture, innovation, scalability"
+        },
+        ux: {
+          label: "User Experience",
+          maxScore: 100,
+          description: "UI design, usability, accessibility, user flow"
+        },
+        presentation: {
+          label: "Presentation Quality",
+          maxScore: 100,
+          description: "Video pitch clarity, communication, demo quality"
+        }
+      }
+    };
+
+    return createSuccessResponse(responseData);
+
   } catch (error: any) {
-    console.error("Get team details error:", error);
-    return createErrorResponse("Failed to retrieve team", "SERVER_ERROR", 500);
+    console.error("Get team for evaluation error:", error);
+    return createErrorResponse("Failed to fetch team details", "SERVER_ERROR", 500);
   }
 }

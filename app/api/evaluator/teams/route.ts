@@ -8,21 +8,17 @@ import ProblemStatement from "@/models/ProblemStatement";
 
 export const dynamic = 'force-dynamic';
 
-function createSuccessResponse(message: string, data: any, status = 200) {
+function createSuccessResponse(data: any, status = 200) {
   return NextResponse.json({
     success: true,
-    message,
     data,
-    timestamp: new Date().toISOString(),
   }, { status });
 }
 
 function createErrorResponse(message: string, code: string, status: number) {
   return NextResponse.json({
     success: false,
-    message,
     error: { code, message },
-    timestamp: new Date().toISOString(),
   }, { status });
 }
 
@@ -46,47 +42,101 @@ export async function GET(request: NextRequest) {
 
     const evaluator = await Evaluator.findOne({ uid: authResult.user.uid });
     if (!evaluator) {
-      return createSuccessResponse("No assigned teams", {
-        teams: [],
-        stats: { assigned: 0, evaluated: 0, pending: 0 },
-      });
+      return createErrorResponse("Evaluator profile not found", "EVALUATOR_NOT_FOUND", 404);
     }
 
-    // Get assigned teams
-    const teamCodes = evaluator.assignedTeams.map((t: any) => t.teamCode);
-    const teams = await Team.find({ teamCode: { $in: teamCodes } });
+    const searchParams = request.nextUrl.searchParams;
+    const page = parseInt(searchParams.get('page') || '1');
+    const limit = parseInt(searchParams.get('limit') || '50');
+    const isEvaluatedParam = searchParams.get('isEvaluated');
+    const appliedFor = searchParams.get('appliedFor');
+    const sortBy = searchParams.get('sortBy') || 'teamName';
+    const sortOrder = searchParams.get('sortOrder') === 'desc' ? -1 : 1;
 
-    // Get problem statements
-    const problemIds = teams.map(t => t.appliedFor).filter(Boolean);
-    const problemStatements = await ProblemStatement.find({ _id: { $in: problemIds } });
+    let assignedTeams = evaluator.assignedTeams || [];
+
+    if (isEvaluatedParam !== null) {
+      const isEvaluated = isEvaluatedParam === 'true';
+      assignedTeams = assignedTeams.filter((t: any) => t.isEvaluated === isEvaluated);
+    }
+
+    const assignedTeamCodes = assignedTeams.map((t: any) => t.teamCode);
+
+    const teamQuery: any = {
+      teamCode: { $in: assignedTeamCodes }
+    };
+
+    if (appliedFor) {
+      teamQuery.appliedFor = appliedFor;
+    }
+
+    const totalTeamsCount = await Team.countDocuments(teamQuery);
+
+    const teams = await Team.find(teamQuery)
+      .sort({ [sortBy]: sortOrder as any })
+      .skip((page - 1) * limit)
+      .limit(limit)
+      .populate('teamMembers.uid');
+
+    const allMemberUids = teams.flatMap(t => t.teamMembers.map(m => m.uid));
+
+    const User = (await import("@/models/User")).default;
+    const ProblemStatement = (await import("@/models/ProblemStatement")).default;
+
+    const users = await User.find({ uid: { $in: allMemberUids } }).select('uid name organisation');
+    const userMap = new Map(users.map(u => [u.uid, u]));
+
+    const uniquePsIds = new Set(teams.map(t => t.appliedFor).filter((id): id is string => !!id));
+    const problemStatements = await ProblemStatement.find({ _id: { $in: Array.from(uniquePsIds) } }).select('_id title');
+    const psMap = new Map(problemStatements.map(ps => [ps._id.toString(), ps]));
 
     const formattedTeams = teams.map(team => {
-      const assignment = evaluator.assignedTeams.find((a: any) => a.teamCode === team.teamCode);
-      const ps = problemStatements.find(p => p._id.toString() === team.appliedFor);
-      
+      const ps = team.appliedFor ? psMap.get(team.appliedFor.toString()) : null;
+
+      const members = team.teamMembers.map(m => {
+        const user = userMap.get(m.uid);
+        return {
+          name: user?.name || 'Unknown',
+          organisation: user?.organisation || 'Unknown'
+        };
+      });
+
       return {
         teamCode: team.teamCode,
         teamName: team.teamName,
+        teamMembers: members,
         memberCount: team.memberCount,
-        appliedFor: ps ? { id: ps._id.toString(), title: ps.title } : null,
-        videoURL: team.videoURL || null,
-        submissionPDF: team.submissionPDF || null,
+        appliedFor: ps ? {
+          id: ps._id.toString(),
+          title: ps.title
+        } : null,
         isEvaluated: team.isEvaluated,
-        scores: team.scores || null,
-        assignedAt: assignment?.assignedAt || null,
+        videoURL: team.videoURL,
+        submissionPDF: team.submissionPDF,
+        anyOtherLink: team.anyOtherLink,
+        submittedAt: team.submittedAt,
       };
     });
 
-    return createSuccessResponse("Assigned teams retrieved successfully", {
+    const stats = {
+      totalAssigned: evaluator.assignedCount,
+      evaluated: evaluator.evaluatedCount,
+      pending: evaluator.assignedCount - evaluator.evaluatedCount
+    };
+
+    return createSuccessResponse({
       teams: formattedTeams,
-      stats: {
-        assigned: evaluator.assignedCount,
-        evaluated: evaluator.evaluatedCount,
-        pending: evaluator.assignedCount - evaluator.evaluatedCount,
+      pagination: {
+        currentPage: page,
+        totalPages: Math.ceil(totalTeamsCount / limit),
+        totalTeams: totalTeamsCount,
+        limit
       },
+      stats
     });
+
   } catch (error: any) {
-    console.error("Get evaluator teams error:", error);
-    return createErrorResponse("Failed to retrieve teams", "SERVER_ERROR", 500);
+    console.error("Get assigned teams error:", error);
+    return createErrorResponse("Failed to fetch assigned teams", "SERVER_ERROR", 500);
   }
 }
